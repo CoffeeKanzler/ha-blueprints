@@ -1,0 +1,143 @@
+blueprint:
+  name: CO₂ Notification (Auto-Clear, ohne Helper)
+  description: >
+    Sendet eine Push-Notification, wenn CO₂ über einen Grenzwert steigt,
+    und löscht dieselbe Notification automatisch, wenn CO₂ wieder unter
+    den Rückkehrwert fällt. Pro Sensor konfigurierbar (Friendly Name, Schwellen, Zeiten).
+  domain: automation
+  input:
+    co2_sensor:
+      name: CO₂ Sensor
+      selector:
+        entity:
+          domain: sensor
+    friendly_name:
+      name: Friendly Name (für Notification)
+      description: z.B. "Wohnzimmer", "Schlafzimmer", "Alpstuga Büro"
+      default: CO₂ Sensor
+      selector:
+        text: {}
+    notify_targets:
+      name: Notification Services
+      description: Wähle einen oder mehrere notify.* Services (z.B. mobile_app_...)
+      selector:
+        entity:
+          domain: notify
+          multiple: true
+    high_threshold:
+      name: Schwelle hoch (ppm)
+      default: 1000
+      selector:
+        number:
+          min: 400
+          max: 5000
+          step: 10
+          mode: slider
+          unit_of_measurement: ppm
+    low_threshold:
+      name: Schwelle niedrig (ppm)
+      default: 600
+      selector:
+        number:
+          min: 400
+          max: 5000
+          step: 10
+          mode: slider
+          unit_of_measurement: ppm
+    high_for:
+      name: Mindestdauer über "hoch"
+      default: "00:03:00"
+      selector:
+        duration: {}
+    low_for:
+      name: Mindestdauer unter "niedrig"
+      default: "00:05:00"
+      selector:
+        duration: {}
+    cooldown_minutes:
+      name: Cooldown (Minuten) gegen Spam
+      description: Wenn CO₂ lange hoch bleibt, wird erst nach Ablauf erneut gepusht (0 = aus).
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 180
+          step: 5
+          mode: slider
+          unit_of_measurement: min
+
+mode: single
+
+variables:
+  sensor_entity: !input co2_sensor
+  name_for_notif: !input friendly_name
+  high: !input high_threshold
+  low: !input low_threshold
+  cooldown: !input cooldown_minutes
+  # stabiler Tag pro Sensor -> Warnung wird ersetzt & kann gecleared werden
+  notif_tag: >-
+    co2_alert_{{ sensor_entity | replace('.', '_') }}
+
+trigger:
+  - platform: numeric_state
+    entity_id: !input co2_sensor
+    above: !input high_threshold
+    for: !input high_for
+    id: high
+
+  - platform: numeric_state
+    entity_id: !input co2_sensor
+    below: !input low_threshold
+    for: !input low_for
+    id: low
+
+condition:
+  # optionaler Cooldown nur für "high"
+  - condition: template
+    value_template: >-
+      {% if trigger.id != 'high' or cooldown | int(0) == 0 %}
+        true
+      {% else %}
+        {% set lt = state_attr(this.entity_id, 'last_triggered') %}
+        {{ lt is none or (as_timestamp(now()) - as_timestamp(lt)) > (cooldown|int(0) * 60) }}
+      {% endif %}
+
+action:
+  - choose:
+      # -----------------------
+      # HIGH -> Warnung senden
+      # -----------------------
+      - conditions:
+          - condition: trigger
+            id: high
+        sequence:
+          - repeat:
+              for_each: !input notify_targets
+              sequence:
+                - service: "{{ repeat.item }}"
+                  data:
+                    title: "CO₂ zu hoch – bitte lüften"
+                    message: >-
+                      {{ name_for_notif }}: {{ states(sensor_entity) | float(0) | round(0) }} ppm
+                      (Ziel < {{ low }} ppm)
+                    data:
+                      tag: "{{ notif_tag }}"
+                      persistent: true
+                      notification_icon: mdi:molecule-co2
+
+      # -----------------------
+      # LOW -> Warnung löschen
+      # -----------------------
+      - conditions:
+          - condition: trigger
+            id: low
+        sequence:
+          - repeat:
+              for_each: !input notify_targets
+              sequence:
+                - service: "{{ repeat.item }}"
+                  data:
+                    message: "clear"
+                    data:
+                      tag: "{{ notif_tag }}"
+                      clear_notification: true
